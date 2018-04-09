@@ -16,7 +16,7 @@ What are [kernel modules][1] and why should you care?
 
 > Kernel modules are pieces of code that can be loaded and unloaded into the kernel upon demand. They extend the functionality of the kernel without the need to reboot the system. 
 
-Things like USB drivers / systems, interface drivers, input drivers, can be distributed in the form of the kernel modules. A kernel module also runs with higher priviledges (kernel space vs user space). You may only have direct hardware register access to e.g. GPIO, PWM, SPI, etc. from there. Kernal modules then expose certain functionality or device files to the user space. Examples of kernel modules are:
+Things like USB drivers / systems, interface drivers, input drivers, can be distributed in the form of the kernel modules. A kernel module also runs with higher priviledges (kernel space vs user space). You may only have direct hardware register access to e.g. GPIO, PWM, SPI, etc. from there. Kernel modules then expose certain functionality or device files to the user space. Examples of kernel modules are:
 * `kmod-spi-dev` - exposes linux SPI device
 * `kmod-fs-ext4` - EXT4 filesystem support
 * `kmod-usb-audio` - Audio over USB devices
@@ -321,6 +321,120 @@ depends:
 
 At the end of this section you were now able to compile a simple kernel module from scratch and load it into the Omega2.
 
+### Let's read a hardware register! 
+
+For a quick additional demo, we can modify the code of the `hello-world` kernel module to read a register from the Omega2's CPU, which is a MT7688. For a reference, you will need the Mediatek MT7688 datasheet: https://labs.mediatek.com/en/chipset/MT7688 
+
+Starting at page 48, the register addresses and meanings are listed in their respective blocks (system config, timer, GPIO, SPI,..). Let's have a look at the `SYSCTL` block.
+
+![datasheet](https://i.stack.imgur.com/RaWWU.png)
+
+Starting at address `0x10000000`, there are several interesting registers we can read out. Let's read out `CHIPID0_3` and `CHIPID4_7`, which contains the ASCII chip name in these two 32-bit registers.
+
+If you were programming a microcontroller without a OS and memory management unit (MMU), you would just set a C pointer variable to that address and start reading from it. However, to read data from this physical memory address in the kernel, we first have to do a memory re-mapping. In an OS, you mostly deal with "virtual addresses", which are remapped by an MMU to real physical address within a memory chip. If we just set a C-pointer to `0x10000000` and read it, we would read this virtual address, which is no good. Virtual addresses are a whole topic on its own. You should consult a lecture on operating systems if you want to know more about this.
+
+The kernel provides in `linux/io.h` functions with which we can accomplish this:
+* `void* ioremap(address, size)` will return a pointer to the virtual memory which is now mapped to the physical address `address`. A total of `size` bytes are mapped to this location
+* `ioread32(mem)`/`ioread16(mem)`/`ioread8(mem)` Reads 32/16/8 bits from specified I/O memory, with pointer previously acquired by `ioremap`
+* `iowrite32`/`iowrite16`/`iowrite8` writes value to memory
+* `iounmap(mem)` for unmapping when you're done 
+
+Knowing these function and addresses, we can read  `CHIPID0_3`,  `CHIPID4_7` and `CHIP_REV_ID` using the following modified `hello-world.c` code:
+
+```c
+#include <linux/module.h>	/* Needed by all modules */
+#include <linux/kernel.h>	/* Needed for KERN_INFO */
+#include <linux/init.h>		/* Needed for the macros */
+#include <linux/io.h>		/* Needed for I/O operations */
+
+/* Addresses of base registers and offsets for certain fields (see datasheet) */
+#define MT7688_SYSCTL_BASE			0x10000000
+#define MT7688_SYSCTL_CHIPID0_3		0x0
+#define MT7688_SYSCTL_CHIPID4_7		0x4
+#define MT7688_SYSCTL_CHIP_REV_ID	0xC
+
+/* Physical address in, 32 bit integer out. */
+static unsigned int ReadReg32(unsigned long addr) {
+	//Remap 4 bytes starting at that address
+	void* virtualMem = ioremap(addr, 4);
+	if(!virtualMem) {
+		printk(KERN_WARNING "Failed to remap register memory");
+		return 0;
+	}
+	//Read 32 bits
+	unsigned int val = ioread32(virtualMem);
+	printk(KERN_INFO "ReadReg32(0x%08x) = 0x%08x\n", (int)addr, val);
+	//Unmap memory again
+	iounmap(virtualMem);
+	//return read value
+	return val;
+}
+
+static int __init hello_2_init(void)
+{
+	printk(KERN_INFO "Hello, world! We're inside the Omega2's kernel.\n");
+
+	unsigned int chipid0_3 = ReadReg32(MT7688_SYSCTL_BASE + MT7688_SYSCTL_CHIPID0_3);
+	//Recover the initial characters
+	//Datasheet says leftmost bits is the last character
+	char id_0 = (char)(chipid0_3 >> 0);
+	char id_1 = (char)(chipid0_3 >> 8);
+	char id_2 = (char)(chipid0_3 >> 16);
+	char id_3 = (char)(chipid0_3 >> 24);
+	//Do the same for chipid 4 to 7
+	unsigned int chipid4_7 = ReadReg32(MT7688_SYSCTL_BASE + MT7688_SYSCTL_CHIPID4_7);
+	char id_4 = (char)(chipid4_7 >> 0);
+	char id_5 = (char)(chipid4_7 >> 8);
+	char id_6 = (char)(chipid4_7 >> 16);
+	char id_7 = (char)(chipid4_7 >> 24);
+
+	//Get revision ID
+	unsigned int chiprev = ReadReg32(MT7688_SYSCTL_BASE + MT7688_SYSCTL_CHIP_REV_ID);
+	//Parse the bits out of the structure
+	int packageId = chiprev >> 16;
+	int verId = (chiprev >> 8) & 0xf;
+	int ecoId = chiprev & 0xf;
+
+	printk(KERN_INFO "CHIP ID IS: '%c%c%c%c%c%c%c%c'\n",
+			id_0, id_1, id_2, id_3, id_4, id_5, id_6, id_7);
+	printk(KERN_INFO "CHIP REV ID: PKG_ID=%d, VER_ID=%d, ECO_ID=%d\n",
+			packageId, verId, ecoId);
+
+	return 0;
+}
+
+static void __exit hello_2_exit(void)
+{
+	printk(KERN_INFO "Goodbye, world!\n");
+}
+
+module_init(hello_2_init);
+module_exit(hello_2_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Maximilian Gerhardt");
+MODULE_DESCRIPTION("Basic kernel module for tutorial with register reading");
+```
+
+Compiling this and loading it into the kernel results in:
+
+```sh
+max@max-VirtualBox:~/source$ make package/hello-world/compile -j4 && scp ./build_dir/target-mipsel_24kc_musl-1.1.16/linux-ramips_mt7688/hello-world/hello-world.ko root@192.168.1.202:/root/.
+
+root@Omega-17FD:~# insmod hello-world.ko
+root@Omega-17FD:~# dmesg
+[ 8402.279877] Hello, world! We're inside the Omega2's kernel.
+[ 8402.285635] ReadReg32(0x10000000) = 0x3637544d
+[ 8402.290142] ReadReg32(0x10000004) = 0x20203832
+[ 8402.294669] ReadReg32(0x1000000c) = 0x00010102
+[ 8402.299175] CHIP ID IS: 'MT7628  '
+[ 8402.302623] CHIP REV ID: PKG_ID=1, VER_ID=1, ECO_ID=2
+```
+
+Great, we've read out the chip ID as "MT7628", just as the datasheet said. Convert the binary string from the datasheet to ASCII to confirm this. We also read out the expected values for the `CHIP_REV_ID` fields. 
+
+This simple example showed you how to read a hardware register as specified in the MT7688's datasheet from the kernel space.
+
 ### Let's build a XBox360 USB gamepad driver!
 
 Now let's do some more serious stuff.
@@ -447,6 +561,7 @@ Installing package 'xpad' from omega2_kmods
 ```
 
 Go into `make menuconfig` -> `Kernel Modules` -> `Input modules` and select `kmod-xpad` and `kmod-input-joydev` with "M". 
+
 ![xpad](https://i.stack.imgur.com/EdM7C.png)
 
 Exit and save, then `make`. Find the kernel modules `xpad.ko` and `joydev.ko` and transfer them to your Omega2.
@@ -552,6 +667,7 @@ Resources used in this tutorial:
 * http://repo.onion.io/omega2/packages/
 * https://github.com/paroj/xpad
 * https://elinux.org/images/9/93/Evtest.c
+* https://labs.mediatek.com/en/chipset/MT7688
 
 My Github repository with example code and libraries: 
 
@@ -561,7 +677,7 @@ My Github repository with example code and libraries:
 
 ### Conclusion
 
-This tutorial showed you what kernel modules are, why we might need them and how to build them. We built a 'hello world' minimal kernel module for a start, then `kmod-input-joydev` and `xpad` to get a USB Xbox360 gamepad working. We then compiled a test program and a library to confirm that we gamepad works.
+This tutorial showed you what kernel modules are, why we might need them and how to build them. We built a 'hello world' minimal kernel module for a start, then expanded the code to read a hardware regster. Finally, we built `kmod-input-joydev` and `xpad` to get a USB Xbox360 gamepad working. We then compiled a test program and a library to confirm that we gamepad works.
 
 [1]: https://wiki.archlinux.org/index.php/Kernel_module
 [2]: http://repo.onion.io/omega2/packages/
